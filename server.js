@@ -1,105 +1,93 @@
 const express = require("express");
 const { createServer } = require("http");
 const { Server } = require("socket.io");
-const { ExpressPeerServer } = require("peer");
 const cors = require("cors");
 
-// ── App 1: Socket.io on port 5000 ────────────────────────────────────────────
 const app = express();
 const httpServer = createServer(app);
 
-app.use(cors({ origin: "*" }));
+// Allow all origins in dev; set ALLOWED_ORIGINS in production
+const allowedOrigins = process.env.ALLOWED_ORIGINS
+    ? process.env.ALLOWED_ORIGINS.split(",").map((o) => o.trim())
+    : "*";
+
+app.use(cors({ origin: allowedOrigins }));
 app.use(express.json());
 
+// Health check — Railway/Render ping this
+app.get("/", (_req, res) => res.json({ status: "ok" }));
 app.get("/health", (_req, res) => res.json({ status: "ok", rooms: rooms.size }));
 
 const io = new Server(httpServer, {
-    cors: { origin: "*", methods: ["GET", "POST"] },
+    cors: { origin: allowedOrigins, methods: ["GET", "POST"] },
+    // Allow both ws and polling so mobile clients work behind proxies
+    transports: ["websocket", "polling"],
 });
 
-// roomId -> { peers: Map<socketId, peerId> }
+// roomId -> Map<socketId, peerId>
 const rooms = new Map();
 
 io.on("connection", (socket) => {
     let currentRoom = null;
     let currentPeerId = null;
 
-    // Flutter socket_io_client sends args as an array [roomId, peerId]
-    // Browser socket.io sends them as separate args (roomId, peerId)
+    // Flutter sends [roomId, peerId] as array; browser sends separate args
     socket.on("join-room", (arg1, arg2) => {
         const roomId = Array.isArray(arg1) ? arg1[0] : arg1;
-        const peerId = Array.isArray(arg1) ? arg1[1] : arg2;
+        const peerId = Array.isArray(arg1) ? arg1[1] : (arg2 ?? socket.id);
 
-        // ── MAX 2 PEERS per room ──────────────────────────────────────────────
         if (!rooms.has(roomId)) rooms.set(roomId, new Map());
         const room = rooms.get(roomId);
 
         if (room.size >= 2) {
-            console.log(`[room:${roomId}] FULL — rejecting ${peerId}`);
+            console.log(`[room:${roomId}] FULL`);
             socket.emit("room-full", roomId);
-            return; // do NOT join
+            return;
         }
 
-        // Leave any previous room first
-        if (currentRoom) {
-            leaveRoom(socket, currentRoom, currentPeerId);
-        }
+        if (currentRoom) leaveRoom(socket, currentRoom, currentPeerId);
 
         currentRoom = roomId;
         currentPeerId = peerId;
         socket.join(roomId);
         room.set(socket.id, peerId);
 
-        // Tell existing peer(s) about the new joiner (send socket.id so replies can be targeted)
         socket.to(roomId).emit("user-connected", { peerId, socketId: socket.id });
-
-        // Tell new joiner the current count
         socket.emit("room-count", room.size);
 
-        console.log(`[room:${roomId}] ${peerId.slice(0, 8)}… joined (${room.size} total)`);
+        console.log(`[room:${roomId}] joined (${room.size}/2)`);
     });
 
-    // Explicit clean exit — called by client before navigating away
-    // This ensures room is cleared BEFORE the socket disconnects
+    // Client sends this BEFORE disconnecting to guarantee fast room cleanup
     socket.on("leave-room", () => {
-        if (currentRoom && currentPeerId) {
+        if (currentRoom) {
             leaveRoom(socket, currentRoom, currentPeerId);
-            currentRoom = null;
-            currentPeerId = null;
+            currentRoom = currentPeerId = null;
         }
     });
 
     socket.on("disconnect", () => {
-        if (currentRoom && currentPeerId) {
-            leaveRoom(socket, currentRoom, currentPeerId);
-        }
+        if (currentRoom) leaveRoom(socket, currentRoom, currentPeerId);
     });
 
-    // ── WebRTC SDP relay — targeted to the other peer only ───────────────────
-
-    // Offer carries the target socket id so we relay only to them
+    // ── WebRTC signaling relay ────────────────────────────────────────────────
     socket.on("offer", (data) => {
-        if (data.targetSocketId) {
-            io.to(data.targetSocketId).emit("offer", { ...data, fromSocketId: socket.id });
-        } else {
-            socket.to(data.roomId).emit("offer", { ...data, fromSocketId: socket.id });
-        }
+        const target = data.targetSocketId;
+        const payload = { ...data, fromSocketId: socket.id };
+        target ? io.to(target).emit("offer", payload)
+            : socket.to(data.roomId).emit("offer", payload);
     });
 
     socket.on("answer", (data) => {
-        if (data.targetSocketId) {
-            io.to(data.targetSocketId).emit("answer", data);
-        } else {
-            socket.to(data.roomId).emit("answer", data);
-        }
+        const target = data.targetSocketId;
+        target ? io.to(target).emit("answer", data)
+            : socket.to(data.roomId).emit("answer", data);
     });
 
     socket.on("ice-candidate", (data) => {
-        if (data.targetSocketId) {
-            io.to(data.targetSocketId).emit("ice-candidate", data);
-        } else {
-            socket.to(data.roomId).emit("ice-candidate", data);
-        }
+        const target = data.targetSocketId;
+        target ? io.to(target).emit("ice-candidate", data)
+            : socket.to(data.roomId).emit("ice-candidate", data);
     });
 });
 
@@ -112,28 +100,14 @@ function leaveRoom(socket, roomId, peerId) {
             if (room.size === 0) rooms.delete(roomId);
         }
         socket.leave(roomId);
-        const label = (peerId && typeof peerId === 'string') ? peerId.slice(0, 8) : String(peerId);
-        console.log(`[room:${roomId}] ${label}… left`);
+        console.log(`[room:${roomId}] left (${rooms.get(roomId)?.size ?? 0}/2)`);
     } catch (err) {
-        console.error("[leaveRoom] error:", err);
+        console.error("[leaveRoom]", err.message);
     }
 }
 
-const SOCKET_PORT = process.env.SOCKET_PORT || 5000;
-httpServer.listen(SOCKET_PORT, () => {
-    console.log(`🔌 Socket.io server  →  http://localhost:${SOCKET_PORT}`);
-});
-
-// ── App 2: PeerJS server on port 9000 (kept for future use) ──────────────────
-const peerApp = express();
-const peerHttpServer = createServer(peerApp);
-peerApp.use(cors({ origin: "*" }));
-
-const peerServer = ExpressPeerServer(peerHttpServer, { debug: false, path: "/" });
-peerApp.use("/peerjs", peerServer);
-peerApp.get("/", (_req, res) => res.json({ status: "peerjs-ok" }));
-
-const PEER_PORT = process.env.PEER_PORT || 9000;
-peerHttpServer.listen(PEER_PORT, () => {
-    console.log(`🤝 PeerJS server      →  http://localhost:${PEER_PORT}/peerjs`);
+// Railway assigns PORT automatically; fallback to 5000 locally
+const PORT = process.env.PORT || 5000;
+httpServer.listen(PORT, () => {
+    console.log(`🔌 Signaling server running on port ${PORT}`);
 });
