@@ -91,15 +91,15 @@ io.on("connection", (socket) => {
     });
 
     socket.on("call-rejected", (data) => {
-        socket.to(data.roomId).emit("call-rejected", data);
+        io.to(data.roomId).emit("call-rejected", data);
     });
 
     socket.on("call-busy", (data) => {
-        socket.to(data.roomId).emit("call-busy", data);
+        io.to(data.roomId).emit("call-busy", data);
     });
 
     socket.on("call-accepted", (data) => {
-        socket.to(data.roomId).emit("call-accepted", data);
+        io.to(data.roomId).emit("call-accepted", data);
     });
 });
 
