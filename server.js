@@ -89,6 +89,18 @@ io.on("connection", (socket) => {
         target ? io.to(target).emit("ice-candidate", data)
             : socket.to(data.roomId).emit("ice-candidate", data);
     });
+
+    socket.on("call-rejected", (data) => {
+        socket.to(data.roomId).emit("call-rejected", data);
+    });
+
+    socket.on("call-busy", (data) => {
+        socket.to(data.roomId).emit("call-busy", data);
+    });
+
+    socket.on("call-accepted", (data) => {
+        socket.to(data.roomId).emit("call-accepted", data);
+    });
 });
 
 function leaveRoom(socket, roomId, peerId) {
